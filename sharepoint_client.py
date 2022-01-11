@@ -1,15 +1,9 @@
 import requests
 import time
-import json
 from requests.exceptions import RequestException
 from requests_ntlm import HttpNtlmAuth
-from urllib.parse import urljoin
 from configuration import Configuration
 from sharepoint_utils import print_and_log
-
-domain = '[REDACTED]'
-username = '[REDACTED]'
-password = '[REDACTED]'
 
 
 class SharePoint:
@@ -18,42 +12,89 @@ class SharePoint:
         configuration = Configuration(
             file_name="sharepoint_connector_config.yml", logger=logger
         )
-        if not configuration.validate():
-            print_and_log(
-                self.logger,
-                "exception",
-                "[Fail] Terminating the connector as the configuration parameters are not valid"
-            )
-            exit(0)
-        self.configs = configuration.get_all_config()
+        self.configs = configuration.configurations
         self.retry_count = int(self.configs.get("retry_count"))
+        self.domain = self.configs.get("sharepoint.domain")
+        self.username = self.configs.get("sharepoint.username")
+        self.password = self.configs.get("sharepoint.password")
 
-    def get(self, rel_url, query):
-        """Invokes a GET call to the Sharepoint server
+    def get(self, rel_url, query, param_name):
+        """ Invokes a GET call to the Sharepoint server
+            :param rel_url: relative url to the sharepoint farm
+            :param query: query for passing arguments to the url
+            :param param_name: parameter name whether it is sites, lists, list_items, drive_items, permissions or deindex
             Returns:
-                    Response of the GET call
+                Response of the GET call
         """
         request_headers = {
             "accept": "application/json;odata=verbose",
             "content-type": "application/json;odata=verbose"
         }
-        url = urljoin(rel_url, query)
-        retry = 0
-        while retry <= self.retry_count:
-            try:
-                response = requests.get(
-                    url,
-                    auth=HttpNtlmAuth(domain + "\\" + username, password),
-                    headers=request_headers
-                )
-                if response.status_code == (requests.codes.ok or requests.codes.not_found):
-                    return response
-                else:
+
+        response_list = {"d": {"results": []}}
+        paginate_query = True
+        skip, top = 0, 5000
+        while paginate_query:
+            if param_name in ["sites", "lists"]:
+                paginate_query = query + f"&$skip={skip}&$top={top}"
+            elif skip == 0 and param_name in ["list_items", "drive_items"]:
+                paginate_query = query + f"&$top={top}"
+            elif param_name in ["permission_users", "permission_groups", "deindex", "attachment"]:
+                paginate_query = query
+            url = rel_url + paginate_query
+            skip += 5000
+            retry = 0
+            while retry <= self.retry_count:
+                try:
+                    response = requests.get(
+                        url,
+                        auth=HttpNtlmAuth(self.domain + "\\" + self.username, self.password),
+                        headers=request_headers
+                    )
+                    if response.status_code == requests.codes.ok:
+                        if param_name in ["sites", "lists"] and response:
+                            response_data = response.json()
+                            response_result = response_data.get("d", {}).get("results")
+                            response_list["d"]["results"].extend(response_result)
+                            if len(response_result) < 5000:
+                                paginate_query = None
+                            break
+                        elif param_name in ["list_items", "drive_items"] and response:
+                            response_data = response.json()
+                            response_list["d"]["results"].extend(response_data.get("d", {}).get("results"))
+                            paginate_query = response_data.get("d", {}).get("__next", False)
+                            break
+                        else:
+                            return response
+                    elif response.status_code >= 400 and response.status_code < 500:
+                        if not (param_name == 'deindex' and response.status_code == 404):
+                            print_and_log(
+                                    self.logger,
+                                    "exception",
+                                    "Error: %s. Error while fetching from the sharepoint, url: %s."
+                                    % (response.reason, url)
+                                )
+                        return response
+                    else:
+                        print_and_log(
+                            self.logger,
+                            "error",
+                            "Error while fetching from the sharepoint, url: %s. Retry Count: %s. Error: %s"
+                            % (url, retry, response.reason)
+                        )
+                        # This condition is to avoid sleeping for the last time
+                        if retry < self.retry_count:
+                            time.sleep(2 ** retry)
+                        retry += 1
+                        paginate_query = None
+                        continue
+
+                except RequestException as exception:
                     print_and_log(
                         self.logger,
-                        "error",
+                        "exception",
                         "Error while fetching from the sharepoint, url: %s. Retry Count: %s. Error: %s"
-                        % (url, retry, response.reason)
+                        % (url, retry, exception)
                     )
                     # This condition is to avoid sleeping for the last time
                     if retry < self.retry_count:
@@ -61,16 +102,24 @@ class SharePoint:
                     else:
                         return False
                     retry += 1
-            except RequestException as exception:
-                print_and_log(
-                    self.logger,
-                    "exception",
-                    "Error while fetching from the sharepoint, url: %s. Retry Count: %s. Error: %s"
-                    % (url, retry, exception)
-                )
-                # This condition is to avoid sleeping for the last time
-                if retry < self.retry_count:
-                    time.sleep(2 ** retry)
-                else:
-                    return False
-                retry += 1
+        if retry > self.retry_count:
+            return response
+        return response_list
+
+    def get_query(self, start_time, end_time, param_name):
+        """ returns the query for each objects
+            :param start_time: start time of the interval for fetching the documents
+            :param end_time: end time of the interval for fetching the documents
+            Returns:
+                query: query for each object
+        """
+        query = ""
+        if param_name in ["sites", "lists"]:
+            query = f"?$filter=(LastItemModifiedDate ge datetime'{start_time}') and (LastItemModifiedDate le datetime'{end_time}')"
+        else:
+            query = f"$filter=(Modified ge datetime'{start_time}') and (Modified le datetime'{end_time}')"
+            if param_name == "list_items":
+                query = "?" + query
+            else:
+                query = "&" + query
+        return query
